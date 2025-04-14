@@ -10,7 +10,10 @@ import numpy as np
 import torch
 
 # First Party
-from instructlab.training.multipack_sampler import MultipackDistributedBatchSampler
+from instructlab.training.multipack_sampler import (
+    MultipackDistributedBatchSampler,
+    PaddingDistributedBatchSampler,
+)
 from instructlab.training.utils import log_rank_0, make_collate_fn
 
 
@@ -109,15 +112,21 @@ def setup_dataloader(
 
     lengths = dataset.get_lengths()
     if sampler == "multipack":
-        sampler = MultipackDistributedBatchSampler(
-            batch_max_length=packing_max_batch_len,
-            lengths=lengths,
-            num_replicas=world_size,
-            rank=rank,
-            seed=seed,
-            padding=not flash_enabled,
+        sampler_cls = (
+            MultipackDistributedBatchSampler
+            if flash_enabled
+            else PaddingDistributedBatchSampler
         )
-        sampler = {"batch_sampler": sampler}
+
+        sampler = {
+            "batch_sampler": sampler_cls(
+                batch_max_length=packing_max_batch_len,
+                lengths=lengths,
+                num_replicas=world_size,
+                rank=rank,
+                seed=seed,
+            )
+        }
     elif sampler == "distributed":
         # Third Party
         from torch.utils.data import DistributedSampler

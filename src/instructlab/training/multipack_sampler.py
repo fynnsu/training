@@ -24,13 +24,15 @@ taken from https://github.com/imoneoi/multipack_sampler
 """
 
 # Standard
-from typing import List, Optional
+from typing import NamedTuple
 
 # Third Party
 from torch.utils.data import Sampler
-import numba
 import numpy as np
 import torch
+import math
+from heapq import heapreplace, heappop, heappush
+from numpy.typing import ArrayLike, NDArray
 import torch.distributed as dist
 
 
@@ -67,13 +69,12 @@ def find_max_pack_len_with_padding(
 
         The function creates a sampler using the MultipackDistributedBatchSampler class, generates batches using the sampler, and then returns the ratio of the dataset size to the number of batches.
         """
-        sampler = MultipackDistributedBatchSampler(
+        sampler = PaddingDistributedBatchSampler(
             batch_max_length=num_tokens_per_gpu,
             lengths=dataset.get_lengths(),
             num_replicas=torch.distributed.get_world_size(),
             rank=torch.distributed.get_rank(),
             seed=seed,
-            padding=True,
         )
         batches = sampler.generate_batches()
         return len(dataset) / len(batches)
@@ -170,189 +171,139 @@ def find_packing_max_batch_len_and_grad_accum(
     return packing_max_batch_len, grad_accum
 
 
-@numba.njit
-def ffd_check(a: np.ndarray, c: int, n: int):
-    # First-fit-decreasing bin packing
-    # Check if a[] could fit in n bins with capacity c
-    # https://en.wikipedia.org/wiki/First-fit-decreasing_bin_packing
+## Multipack Distributed Batch Sampler
+class _Bin(NamedTuple):
+    """Helper named tuple for `lpt_packed_batch`"""
 
-    a = np.sort(a)[::-1]
-    bins = np.full((n,), c, dtype=a.dtype)
-    for size in a:
-        not_found = True
-        for idx in range(n):
-            if bins[idx] >= size:
-                bins[idx] -= size
-                not_found = False
-                break
-
-        if not_found:
-            return False
-
-    return True
+    fill: int  # sum of items in _Bin
+    rank: int  # device rank _Bin is associated with
 
 
-@numba.njit
-def ffd_check_padding(a: np.ndarray, c: int, n: int):
-    # First-fit-decreasing bin packing
-    # Check if a[] could fit in n bins with capacity c
-    # https://en.wikipedia.org/wiki/First-fit-decreasing_bin_packing
-
-    a = np.sort(a)[::-1]
-    bins_max_lengths = np.zeros(
-        (n,), dtype=a.dtype
-    )  # Track the maximum length in each bin
-    bins_num_samples = np.zeros(
-        (n,), dtype=np.int_
-    )  # Track the number of samples in each bin
-
-    for size in a:
-        not_found = True
-        for idx in range(n):
-            # Calculate the new capacity if size is added to the bin
-            new_capacity = max(bins_max_lengths[idx], size) * (
-                bins_num_samples[idx] + 1
-            )
-            if new_capacity <= c:
-                bins_max_lengths[idx] = max(bins_max_lengths[idx], size)
-                bins_num_samples[idx] += 1
-                not_found = False
-                break
-
-        if not_found:
-            return False
-
-    return True
-
-
-@numba.njit
-def ffd_with_result(a: np.ndarray, c: int, start_index: int):
-    # First-fit-decreasing bin packing (with result return)
-
-    indices = np.argsort(a)[::-1]
-    a = a[indices]
-
-    bins = []
-    bins_result = []
-    for a_id, size in enumerate(a):
-        add_new = True
-        for idx in range(len(bins)):
-            if bins[idx] >= size:
-                bins[idx] -= size
-                bins_result[idx].append(indices[a_id] + start_index)
-                add_new = False
-                break
-
-        if add_new:
-            bins.append(c - size)
-            bins_result.append([indices[a_id] + start_index])
-
-    return bins_result
-
-
-@numba.njit
-def ffd_with_result_padding(a: np.ndarray, c: int, start_index: int):
-    # First-fit-decreasing bin packing (with result return)
-
-    indices = np.argsort(a)[::-1]
-    a = a[indices]
-
-    bins_max_lengths = []  # Track the maximum length in each bin
-    bins_num_samples = []  # Track the number of samples in each bin
-    bins_result = []  # Track the indices of the samples in each bin
-
-    for a_id, size in enumerate(a):
-        add_new = True
-        for idx in range(len(bins_max_lengths)):
-            # Calculate the new capacity if size is added to the bin
-            new_capacity = max(bins_max_lengths[idx], size) * (
-                bins_num_samples[idx] + 1
-            )
-            if new_capacity <= c:
-                bins_max_lengths[idx] = max(bins_max_lengths[idx], size)
-                bins_num_samples[idx] += 1
-                bins_result[idx].append(indices[a_id] + start_index)
-                add_new = False
-                break
-
-        if add_new:
-            bins_max_lengths.append(size)
-            bins_num_samples.append(1)
-            bins_result.append([indices[a_id] + start_index])
-
-    return bins_result
-
-
-@numba.njit
-def allocate(
+def lpt_packed_batch(
     lengths: np.ndarray,
-    lengths_cumsum: np.ndarray,
+    batch_max_length: int,
+    num_replicas: int,
+    start_index: int,
     rank: int,
-    c: int,
-    n: int,
-    padding: bool = True,
-):
-    # Dynamic batch allocator, similar to Multifit
-    # https://en.wikipedia.org/wiki/Multifit_algorithm
-    # ~99.5% efficiency on OpenChat training set (12 * 2048 ctx len)
+) -> None | list:
+    """
+    Check if lengths can be distributed into n machines with at most batch_max_length per machine and return local rank's batch.
 
-    s = 0
-    start_index = 0
-    result = []
+    Uses the LPT (Longest processing time first scheduling) algorithm
+    Time: O(|lengths| log |lengths| + |lengths| log n)
 
-    while True:
-        # binary search [l, r)
-        l = 1
-        r = 1 + np.searchsorted(lengths_cumsum[start_index:], s + c * n, "right")
-
-        while r - l > 1:
-            m = (l + r) // 2
-            if padding:
-                check = ffd_check_padding(lengths[start_index : start_index + m], c, n)
-            else:
-                check = ffd_check(lengths[start_index : start_index + m], c, n)
-            if check:
-                l = m
-            else:
-                r = m
-
-        # use length l
-        if padding:
-            batch = ffd_with_result_padding(
-                lengths[start_index : start_index + l], c, start_index
-            )
-        else:
-            batch = ffd_with_result(
-                lengths[start_index : start_index + l], c, start_index
-            )
-        assert len(batch) <= n
-        if len(batch) < n:
-            break
-
-        start_index += l
-        s = lengths_cumsum[start_index - 1]
-
-        # add local rank
-        result.append(batch[rank])
-
-    return result, s, len(result) * c * n
-
-
-class MultipackDistributedBatchSampler(Sampler):
-    """Unpadded length sampling using Multipack.
-    Approximate (at most ~1.22x) the optimal solution of the identical-machines scheduling problem, which is NP-hard.
+    Returns:
+    `None` if unable to find a valid packing. Otherwise return the batch indices that correspond to `rank`.
     """
 
+    # Greedily assign lengths (in decreasing order) to the least full rank until they are all assigned or
+    # we run out of space.
+    local_batch = []
+    heap = [_Bin(0, i) for i in range(num_replicas)]
+
+    # sort in descending order
+    indices = np.argsort(lengths)[::-1]
+
+    for idx, size in zip(indices, lengths[indices]):
+        new_fill = heap[0].fill + size
+        if new_fill > batch_max_length:
+            # Size doesn't fit in least full batch (or any others), can't satisfy requirements
+            return None
+
+        if heap[0].rank == rank:
+            # minimum bucket corresponds to the local rank -> add idx to local batch
+            local_batch.append(start_index + idx)
+
+        _ = heapreplace(heap, _Bin(new_fill, heap[0].rank))
+
+    return local_batch
+
+
+def assign_to_packed_batches(
+    lengths: np.ndarray,
+    batch_max_length: int,
+    rank: int,
+    num_replicas: int,
+) -> list[NDArray]:
+    """Distribute lengths to batches across all ranks, while respecting batch_max_length. Uses a binary search + LPT algorithm
+
+    Args:
+        lengths (np.ndarray): array of dataset sample lengths
+        batch_max_length (int): maximum allowed sum of lengths in batch
+        rank (int): local rank to collect batches for
+        num_replicas (int): world size to distribute batches to
+
+    Returns:
+        tuple[list, int, int]:
+            - list of np.arrays containing the indices for each batch on the local rank
+            - sum of dataset lengths included (total sum of lengths in dataset minus any that were dropped at end of dataset)
+            - total token capacity if each batch maxed out batch_max_length
+    """
+
+    lengths_so_far = 0
+    start_index = 0
+    result = []
+    lengths_cumsum = np.cumsum(lengths)
+
+    # binary search for max integer x such that the next x elements in shuffled lengths array can be packed into `num_replicas` batches
+    # Add the local rank's batch to `result` and repeat until end of dataset
+    while True:
+        # binary search in [1, 1 + upper bound for x)
+        left = 1
+        right = 1 + np.searchsorted(
+            lengths_cumsum[start_index:],
+            lengths_so_far + batch_max_length * num_replicas,
+            "right",
+        )
+
+        batch = None
+        while right - left > 1 and right > num_replicas:
+            mid = (left + right) // 2
+            batch = lpt_packed_batch(
+                lengths[start_index : start_index + mid],
+                batch_max_length,
+                num_replicas,
+                start_index,
+                rank,
+            )
+            if batch is None:
+                right = mid
+            else:
+                left = mid
+
+        if batch is None:
+            batch = lpt_packed_batch(
+                lengths[start_index : start_index + left],
+                batch_max_length,
+                num_replicas,
+                start_index,
+                rank,
+            )
+
+        if left < num_replicas:
+            # Can't allocate at least one length to each rank
+            # Note: if left >= num_replicas, we're guaranteed to have at least one length on each machine
+            # because LPT assigns values greedily to the least full machine on each step
+            break
+
+        start_index += left
+        lengths_so_far = lengths_cumsum[start_index - 1]
+
+        # append only result for local rank (already filtered in lpt_packed_batch)
+        result.append(batch)
+
+    return result
+
+
+class BaseDistributedBatchSampler(Sampler):
     def __init__(
         self,
         batch_max_length: int,
-        lengths: List[int],
-        num_replicas: Optional[int] = None,
-        rank: Optional[int] = None,
+        lengths: list[int],
+        num_replicas: int | None = None,
+        rank: int | None = None,
         seed: int = 0,
-        padding: bool = True,
     ):
-        # Get rank
         if num_replicas is None:
             if not dist.is_available():
                 raise RuntimeError("Requires distributed package to be available")
@@ -365,56 +316,27 @@ class MultipackDistributedBatchSampler(Sampler):
         self.num_replicas = num_replicas
         self.rank = rank
         self.seed = seed
-
-        self.batch_max_length = batch_max_length
-        self.lengths = lengths
-        assert isinstance(self.lengths, np.ndarray)
-
         self.epoch = 0
+        self.batch_max_length = batch_max_length
+        self.lengths = np.array(lengths)
+        if self.lengths.ndim != 1:
+            msg = f"lengths must be coercible into a 1-dimensional numpy array. Instead found a {self.lengths.ndim}d array."
+            raise ValueError(msg)
 
-        # statistics
-        self.eff_total_used = 0
-        self.eff_total_slots = 0
-        self.padding = padding
+        self.valid_indices = np.nonzero(self.lengths <= self.batch_max_length)[0]
+        if len(self.valid_indices) < len(self.lengths):
+            # todo: change this to a warning
+            print(
+                f"\033[33mDropping {len(self.lengths) - len(self.valid_indices)} samples longer than batch_max_length. Ensure that the right max_batch_length is used during data processing.\033[0m"
+            )
+
+        self.last_generation = (-1, None)
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
 
-    def generate_batches(self, set_stats=False):
-        indices = np.random.default_rng(seed=self.seed + self.epoch).permutation(
-            len(self.lengths)
-        )
-
-        # remove indices where the entries are longer than batch max length
-        indices = indices[self.lengths[indices] <= self.batch_max_length]
-        if len(indices) < len(self.lengths):
-            print(
-                f"\033[33mDropping {len(self.lengths) - len(indices)} samples longer than batch_max_length. Ensure that the right max_batch_length is used during data processing.\033[0m"
-            )
-
-        lengths = self.lengths[indices]
-        lengths_cumsum = np.cumsum(lengths)
-
-        batches, total_used, total_slots = allocate(
-            lengths=lengths,
-            lengths_cumsum=lengths_cumsum,
-            rank=self.rank,
-            c=self.batch_max_length,
-            n=self.num_replicas,
-            padding=self.padding,
-        )
-
-        batches = [indices[batch] for batch in batches]
-
-        # statistics
-        if set_stats:
-            self.eff_total_used += total_used
-            self.eff_total_slots += total_slots
-
-        return batches
-
     def __iter__(self):
-        batches = self.generate_batches(set_stats=True)
+        batches = self.generate_batches()
         return iter(batches)
 
     def __len__(self):
@@ -424,5 +346,294 @@ class MultipackDistributedBatchSampler(Sampler):
         batches = self.generate_batches()
         return len(batches)
 
-    def efficiency(self):
-        return self.eff_total_used / self.eff_total_slots
+
+class MultipackDistributedBatchSampler(BaseDistributedBatchSampler):
+    def __init__(
+        self,
+        batch_max_length: int,
+        lengths: ArrayLike,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        seed: int = 0,
+    ):
+        """Efficient distributed packing sampler for linear attention style models
+
+        Args:
+            batch_max_length (int): max number of tokens in a single batch per device
+            lengths (ArrayLike[int]): the lengths of each sample in the dataset
+            num_replicas (int | None, optional): The number of replicas to split the dataset across. Defaults to None.
+            rank (int | None, optional): The local rank to collect batches for. Defaults to None.
+            seed (int, optional): Seed for RNG, must be the same on all ranks. Defaults to 0.
+        """
+        super().__init__(batch_max_length, lengths, num_replicas, rank, seed)
+
+    def generate_batches(self) -> list[NDArray]:
+        """Generate batches for local rank
+
+        Returns:
+            list[NDArray]: list of np.arrays containing the indices for each batch on the local rank
+        """
+
+        if self.last_generation[0] == self.epoch:
+            return self.last_generation[1]
+
+        rng = np.random.default_rng(seed=self.seed + self.epoch)
+        indices = rng.permutation(self.valid_indices)
+
+        batches = assign_to_packed_batches(
+            self.lengths[indices], self.batch_max_length, self.rank, self.num_replicas
+        )
+
+        # Currently the indices in batches are relative to the shuffled self.lengths[indices]
+        # We translate them so that they are instead relative to the overall unshuffled self.lengths array
+        batches = [indices[batch] for batch in batches]
+
+        # Cache result
+        self.last_generation = (self.epoch, batches)
+        return batches
+
+
+## Padding Distributed Batch Sampler
+class _HeapBucket(NamedTuple):
+    # Note: Negative values are negative for sorting keys because heapq uses a min-heap
+    neg_cost: int  # Negative total cost of elements in bucket being padded to max length in bucket
+    neg_num_els: int  # Negative number of elements in bucket
+    min_ind: int  # Index of minimum value in bucket
+    max_ind: int  # Index of maximum value in bucket
+
+
+def compute_bucket_bounds(
+    lengths: NDArray, num_buckets: int, min_bucket_size: int
+) -> NDArray:
+    """Compute bucket seperators for lengths data using greedy bucket splitting algorithm
+
+    Args:
+        lengths (NDArray[int]): the lengths of dataset samples to bucket.
+        num_buckets (int, optional): maximum number of buckets to produce. It is possible that less than
+            `num_buckets` buckets will be produced if producing more buckets would violate the `min_bucket_size`
+        min_bucket_size (int, optional): the minimum number of elements in any bucket.
+
+    Note: this algorithm does not produce optimal bucket splits but does attempt to greedily reduce the amount of padding tokens required
+    and empirically outperforms simple equidistant or equidensity bucketing approaches on real datasets.
+
+    Returns:
+        NDArray: max values (exclusive) for each bucket. shape = [n] where n <= `num_buckets`
+    """
+
+    # Define: cost of bucket C(b) = max(b) * len(b)
+    # Assign all data to 1 bucket to start
+    # While number of buckets < num_buckets:
+    #  take most expensive bucket and split it into buckets (b_l, b_r) such that C(b_l) + C(b_r) is minimized
+
+    lengths = np.sort(lengths)
+    n_lengths = len(lengths)
+    done_buckets = []
+
+    # Note: we use a min-heap to keep track of the most expensive bucket, therefore cost and num elements (tie-breaker) are stored as negative values
+    heap = [_HeapBucket(-n_lengths * lengths[-1], -n_lengths, 0, n_lengths)]
+
+    while heap and len(done_buckets) + len(heap) < num_buckets:
+        bucket = heappop(heap)
+
+        assert -bucket.neg_num_els >= min_bucket_size
+        assert bucket.max_ind - bucket.min_ind == -bucket.neg_num_els
+
+        if -bucket.neg_num_els < min_bucket_size * 2:
+            # _HeapBucket is too small to split, mark as done by removing from heap
+            done_buckets.append(bucket)
+            continue
+
+        # Find optimal split index
+        min_cost = float("inf")
+        split_idx = -1
+
+        # `step` makes inner loop O(1) for large datasets
+        step = max(1, len(lengths) // 10000)
+
+        # For loop is guaranteed to run at least once (by previous if condition)
+        for i in range(
+            bucket.min_ind + min_bucket_size, bucket.max_ind - min_bucket_size + 1, step
+        ):
+            n_el_left = i - bucket.min_ind
+            n_el_right = bucket.max_ind - i
+
+            cost = n_el_left * lengths[i - 1] + n_el_right * lengths[bucket.max_ind - 1]
+            if cost < min_cost:
+                min_cost = cost
+                split_idx = i
+
+        # Split and push new buckets onto heap
+        n_el_left = split_idx - bucket.min_ind
+        n_el_right = bucket.max_ind - split_idx
+        cost_left = n_el_left * lengths[split_idx - 1]
+        cost_right = n_el_right * lengths[bucket.max_ind - 1]
+        heappush(heap, _HeapBucket(-cost_left, -n_el_left, bucket.min_ind, split_idx))
+        heappush(heap, _HeapBucket(-cost_right, -n_el_right, split_idx, bucket.max_ind))
+
+    bucket_splits = []
+    for b in done_buckets + heap:
+        if b.max_ind < n_lengths:
+            bucket_splits.append(lengths[b.max_ind])
+        else:
+            # Special handling for last bucket because b.max_ind is exclusive
+            bucket_splits.append(lengths[-1] + 1)
+
+    return np.array(sorted(bucket_splits))
+
+
+def assign_to_padded_batches(
+    lengths: NDArray, max_tokens: int, bucket_limits: NDArray
+) -> list[NDArray]:
+    """Uses BucketSampler algorithm to distribute lengths to padded batches
+
+    BucketSampler: https://aclanthology.org/2023.findings-emnlp.782.pdf
+
+    Args:
+        lengths (NDArray): The lengths of dataset samples
+        max_tokens (int): maximum number of tokens (including padding) in a batch
+        bucket_limits (NDArray): Max value (exclusive) for each bucket. For example
+            for buckets [a, b), [b, c), [c, d), bucket_limits = [b, c, d]
+
+    Returns:
+        - list of np.arrays containing the indices for each batch
+    """
+
+    num_buckets = len(bucket_limits)
+    bucket_indices = [[] for _ in range(num_buckets)]  # indices in each bucket
+    bucket_max = [0 for _ in range(num_buckets)]  # max value in each bucket
+    batches = []
+
+    # Iterate through lengths, assigning to buckets
+    # Once a bucket is full, it becomes a batch and the bucket is reset
+    for idx, size in enumerate(lengths):
+        bucket_idx = np.searchsorted(bucket_limits, size, "left")
+        new_max_length = max(bucket_max[bucket_idx], size)
+        new_num_elements = len(bucket_indices[bucket_idx]) + 1
+
+        if new_num_elements * new_max_length <= max_tokens:
+            bucket_max[bucket_idx] = new_max_length
+            bucket_indices[bucket_idx].append(idx)
+        else:
+            batches.append(bucket_indices[bucket_idx])
+            bucket_indices[bucket_idx] = [idx]
+            bucket_max[bucket_idx] = size
+
+    # Combine leftover buckets greedily
+    new_bucket_indices = []
+    new_bucket_max = 0
+    for bucket_idx in range(num_buckets):
+        for idx in bucket_indices[bucket_idx]:
+            size = lengths[idx]
+            new_max_length = max(new_bucket_max, size)
+            new_num_elements = len(new_bucket_indices) + 1
+
+            if new_num_elements * new_max_length <= max_tokens:
+                new_bucket_max = new_max_length
+                new_bucket_indices.append(idx)
+            else:
+                batches.append(new_bucket_indices)
+                new_bucket_indices = [idx]
+                new_bucket_max = size
+
+    if new_bucket_indices:
+        batches.append(new_bucket_indices)
+
+    return batches
+
+
+class PaddingDistributedBatchSampler(BaseDistributedBatchSampler):
+    def __init__(
+        self,
+        batch_max_length: int,
+        lengths: list[int],
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        seed: int = 0,
+        num_buckets: int = 200,
+        bucket_strategy: str = "min_split",
+        min_bucket_size: int = 1,
+    ):
+        """Efficient distributed padding sampler for quadratic attention models
+
+        Args:
+            batch_max_length (int): max number of tokens in a single batch per device
+            lengths (ArrayLike[int]): the lengths of each sample in the dataset
+            num_replicas (int | None, optional): The number of replicas to split the dataset across. Defaults to None.
+            rank (int | None, optional): The local rank to collect batches for. Defaults to None.
+            seed (int, optional): Seed for RNG, must be the same on all ranks. Defaults to 0.
+            num_buckets (int, optional): Number of buckets to split dataset into. Defaults to 200.
+            bucket_strategy (str, optional): Algorithm for selecting bucket boundaries. Choice of ["min_split", "equidistant", "equidensity"]. Defaults to "min_split".
+            min_bucket_size (int, optional): Minimum number of samples in each bucket. Only when bucket_strategy=="min_split". Defaults to 1.
+        """
+        super().__init__(batch_max_length, lengths, num_replicas, rank, seed)
+
+        if bucket_strategy == "min_split":
+            bucket_splits = compute_bucket_bounds(
+                lengths, num_buckets=num_buckets, min_bucket_size=min_bucket_size
+            )
+        elif bucket_strategy == "equidistant":
+            max_length = max(lengths)
+            min_length = min(lengths)
+            step = 1 / num_buckets
+            bucket_splits = np.array(
+                [
+                    math.ceil(
+                        (step + step * x) * (max_length - min_length) + min_length
+                    )
+                    for x in range(num_buckets)
+                ]
+            )
+            # Make last bucket include longest element (exclusive)
+            bucket_splits[-1] = lengths[-1] + 1
+        elif bucket_strategy == "equidensity":
+            step = 1 / num_buckets
+            bucket_splits = np.quantile(
+                lengths, np.array([step + step * x for x in range(num_buckets)])
+            )
+            # Make last bucket include longest element (exclusive)
+            bucket_splits[-1] = lengths[-1] + 1
+        else:
+            msg = f"Invalid value for bucket_strategy: {bucket_strategy}. Must be one of {{'min_split', 'equidistant', 'equidensity'}}."
+            raise ValueError(msg)
+
+        self.bucket_splits = bucket_splits
+
+    def generate_batches(self):
+        """Generate batches for local rank
+
+        Returns:
+            list[NDArray]: list of np.arrays containing the indices for each batch on the local rank
+        """
+
+        if self.last_generation[0] == self.epoch:
+            return self.last_generation[1]
+
+        rng = np.random.default_rng(seed=self.seed + self.epoch)
+        indices = rng.permutation(self.valid_indices)
+
+        batches = assign_to_padded_batches(
+            self.lengths[indices], self.batch_max_length, self.bucket_splits
+        )
+
+        # shuffle batches
+        batches = [batches[i] for i in rng.permutation(len(batches))]
+
+        # make len(batches) a multiple of num_replicas
+        extra_batches = len(batches) % self.num_replicas
+        if extra_batches:
+            batches = batches[:-extra_batches]
+
+        # Filter out batches that belong to other ranks
+        batches = [
+            batch
+            for idx, batch in enumerate(batches)
+            if idx % self.num_replicas == self.rank
+        ]
+
+        # Currently the indices in batches are relative to the shuffled self.lengths[indices]
+        # We translate them so that they are instead relative to the overall unshuffled self.lengths array
+        batches = [indices[batch] for batch in batches]
+
+        # Cache result
+        self.last_generation = (self.epoch, batches)
+        return batches
