@@ -10,8 +10,9 @@ import numpy as np
 import torch
 
 # First Party
-from instructlab.training.multipack_sampler_v2 import MultipackDistributedBatchSamplerV2
 from instructlab.training.multipack_sampler import MultipackDistributedBatchSampler
+from instructlab.training.multipack_sampler_v2 import MultipackDistributedBatchSamplerV2
+from instructlab.training.padding_sampler import PaddingDistributedBatchSampler
 from instructlab.training.utils import log_rank_0, make_collate_fn
 
 
@@ -124,6 +125,15 @@ def setup_dataloader(
         sampler_config = {"batch_sampler": sampler_obj}
     elif sampler == "multipack_v2":
         sampler_obj = MultipackDistributedBatchSamplerV2(
+            batch_max_length=packing_max_batch_len,
+            lengths=lengths,
+            num_replicas=world_size,
+            rank=rank,
+            seed=seed,
+        )
+        sampler_config = {"batch_sampler": sampler_obj}
+    elif sampler == "padding":
+        sampler_obj = PaddingDistributedBatchSampler(
             batch_max_length=packing_max_batch_len,
             lengths=lengths,
             num_replicas=world_size,
