@@ -4,7 +4,7 @@ name: E2E (NVIDIA L40S x4)
 
 on:
   schedule:
-    - cron: '0 16 * * *' # Runs at 4PM UTC every day
+    - cron: '0 2 * * *' # Runs at 2AM UTC every day
   workflow_dispatch:
     inputs:
       pr_or_branch:
