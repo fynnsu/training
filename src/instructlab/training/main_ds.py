@@ -829,6 +829,13 @@ def run_training(torch_args: TorchrunArgs, train_args: TrainingArgs) -> None:
     if train_args.keep_last_checkpoint_only:
         command.append("--keep_last_checkpoint_only")
 
+    if train_args.run_name:
+        command.append(f"--log_level={train_args.log_level}")
+    if train_args.run_name:
+        command.append(f"--run_name={train_args.run_name}")
+    if train_args.logger_type:
+        command.append(f"--logger_type={train_args.logger_type}")
+
     logger.info("Running training command as subprocess: %s", " ".join(command))
     process = None
     interrupt: KeyboardInterrupt | Exception | None = None

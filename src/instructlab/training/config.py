@@ -228,3 +228,8 @@ class TrainingArgs(BaseModel):
         default=False,
         description="Whether to use Liger kernels for training.",
     )
+
+    # logging config
+    log_level: str | None = None
+    logger_type: str | None = None
+    run_name: str | None = None

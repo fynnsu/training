@@ -5,6 +5,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import subprocess
 
 # Third Party
 from transformers import AutoModelForCausalLM
@@ -48,6 +49,19 @@ DEFAULT_TORCHRUN_ARGS = {
 
 REFERENCE_TEST_MODEL = "instructlab/granite-7b-lab"
 RUNNER_CPUS_EXPECTED = 4
+
+
+@pytest.fixture(scope="module")
+def git_commit():
+    try:
+        commit = (
+            subprocess.check_output(["git", "rev-parse", "HEAD"])
+            .decode("ascii")
+            .strip()
+        )
+        return commit
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
 
 
 @pytest.fixture(scope="module")
@@ -221,12 +235,16 @@ def test_training_feature_matrix(
     prepared_data_dir: pathlib.Path,
     cpu_offload: bool,
     dist_backend: DistributedBackend,
+    git_commit: str,
 ) -> None:
     train_args = TrainingArgs(
         model_path=str(cached_test_model),
         data_path=str(cached_training_data),
         data_output_dir=str(prepared_data_dir),
         ckpt_output_dir=str(checkpoint_dir),
+        run_name=f"test_training_feature_matrix_{dist_backend.value}_cpu_offload_{cpu_offload}/{git_commit}",
+        logger_type="async,wandb,tensorboard",
+        log_level="DEBUG",
         **MINIMAL_TRAINING_ARGS,
     )
 
