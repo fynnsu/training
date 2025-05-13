@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: Run Training with Wandb
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          python3.11 -m venv venv
+          source venv/bin/activate
+          pip install . wandb
+
+      - name: Initialize WANDB
+        run: |
+          wandb login ${{ secrets.WANDB_API_KEY }}
+
+      - name: Run Dummy Training
+        env:
+          WANDB_PROJECT: "instructlab-ci"
+          WANDB_ENTITY: "fschmitt-red-hat"
+        run: |
+          . venv/bin/activate
+          python src/instructlab/training/dummy_run.py
