@@ -24,14 +24,14 @@ def main():
         for _ in range(100):
             logger.info(
                 {
-                    "train/loss": 10 - 0.001 * global_step + random.random(),
+                    "train/loss": 10 - 0.0011 * global_step + random.random(),
                     "epoch": epoch,
                     "step": global_step,
                 }
             )
             global_step += 1
         logger.info(
-            {"val/loss": 1 - 0.01 * epoch + random.random() / 3},
+            {"val/loss": 1 - 0.01 * epoch + random.random() / 10},
             extra={"step": global_step},
         )
 
